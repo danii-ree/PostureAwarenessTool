@@ -1,0 +1,168 @@
+✔ login: correct, wrong, malformed JSON, missing configuration (36.953327ms)
+✖ config: rejects absent, forged, expired and extended tokens (4.532073ms)
+✖ hours: rejects absent, forged, expired and extended tokens (1.487927ms)
+✖ status: rejects absent, forged, expired and extended tokens (0.960705ms)
+✖ recalibrate: rejects absent, forged, expired and extended tokens (0.872444ms)
+✖ export: rejects absent, forged, expired and extended tokens (0.884818ms)
+✖ data: rejects absent, forged, expired and extended tokens (0.366516ms)
+✔ device key check (1.250693ms)
+✔ config clamps values and status reflects saved settings (2.882258ms)
+✔ ago bucketing, summary clamps, retention and dynamic GETs (1.564662ms)
+✔ recalibration remains pending until device acknowledges (1.624774ms)
+✖ export and deletion remove history and backups but preserve settings (1.295394ms)
+✖ concurrent config parse and upload preserve both writes (1.132179ms)
+✖ null JSON and null rows do not crash handlers (0.42237ms)
+ℹ tests 14
+ℹ suites 0
+ℹ pass 5
+ℹ fail 9
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 69.299433
+
+✖ failing tests:
+
+test at ../../home/daniel/posture_corrector/posture-vest/web/test/routes.test.mjs:42:46
+✖ config: rejects absent, forged, expired and extended tokens (4.532073ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  200 !== 401
+  
+      at TestContext.<anonymous> (file:///home/daniel/posture_corrector/posture-vest/web/test/routes.test.mjs:43:89)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 200,
+    expected: 401,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at ../../home/daniel/posture_corrector/posture-vest/web/test/routes.test.mjs:42:46
+✖ hours: rejects absent, forged, expired and extended tokens (1.487927ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  200 !== 401
+  
+      at TestContext.<anonymous> (file:///home/daniel/posture_corrector/posture-vest/web/test/routes.test.mjs:43:89)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 200,
+    expected: 401,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at ../../home/daniel/posture_corrector/posture-vest/web/test/routes.test.mjs:42:46
+✖ status: rejects absent, forged, expired and extended tokens (0.960705ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  200 !== 401
+  
+      at TestContext.<anonymous> (file:///home/daniel/posture_corrector/posture-vest/web/test/routes.test.mjs:43:89)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 200,
+    expected: 401,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at ../../home/daniel/posture_corrector/posture-vest/web/test/routes.test.mjs:42:46
+✖ recalibrate: rejects absent, forged, expired and extended tokens (0.872444ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  200 !== 401
+  
+      at TestContext.<anonymous> (file:///home/daniel/posture_corrector/posture-vest/web/test/routes.test.mjs:43:89)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 200,
+    expected: 401,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at ../../home/daniel/posture_corrector/posture-vest/web/test/routes.test.mjs:42:46
+✖ export: rejects absent, forged, expired and extended tokens (0.884818ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  200 !== 401
+  
+      at TestContext.<anonymous> (file:///home/daniel/posture_corrector/posture-vest/web/test/routes.test.mjs:43:89)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 200,
+    expected: 401,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at ../../home/daniel/posture_corrector/posture-vest/web/test/routes.test.mjs:42:46
+✖ data: rejects absent, forged, expired and extended tokens (0.366516ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  404 !== 401
+  
+      at TestContext.<anonymous> (file:///home/daniel/posture_corrector/posture-vest/web/test/routes.test.mjs:43:89)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 404,
+    expected: 401,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at ../../home/daniel/posture_corrector/posture-vest/web/test/routes.test.mjs:69:1
+✖ export and deletion remove history and backups but preserve settings (1.295394ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  404 !== 200
+  
+      at TestContext.<anonymous> (file:///home/daniel/posture_corrector/posture-vest/web/test/routes.test.mjs:72:9)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 404,
+    expected: 200,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at ../../home/daniel/posture_corrector/posture-vest/web/test/routes.test.mjs:75:1
+✖ concurrent config parse and upload preserve both writes (1.132179ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  0 !== 1
+  
+      at TestContext.<anonymous> (file:///home/daniel/posture_corrector/posture-vest/web/test/routes.test.mjs:79:9)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 0,
+    expected: 1,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at ../../home/daniel/posture_corrector/posture-vest/web/test/routes.test.mjs:81:1
+✖ null JSON and null rows do not crash handlers (0.42237ms)
+  TypeError: Cannot read properties of null (reading 'password')
+      at Module.POST (file:///tmp/vest-test-2FQcMR/login.mjs:5:15)
+      at async TestContext.<anonymous> (file:///home/daniel/posture_corrector/posture-vest/web/test/routes.test.mjs:82:13)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7)

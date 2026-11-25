@@ -1,0 +1,18 @@
+npm notice run posture-vest-web@1.0.0 start
+npm notice run next start
+  ▲ Next.js 14.2.35
+  - Local:        http://localhost:3000
+
+ ✓ Starting...
+ ✓ Ready in 318ms
+ ⨯ TypeError: (0 , s.Nv) is not a function
+    at c (/home/daniel/posture_corrector/posture-vest/web/.next/server/app/api/device/sync/route.js:1:677)
+    at /home/daniel/posture_corrector/posture-vest/web/node_modules/next/dist/compiled/next-server/app-route.runtime.prod.js:6:38417
+    at /home/daniel/posture_corrector/posture-vest/web/node_modules/next/dist/server/lib/trace/tracer.js:140:36
+    at NoopContextManager.with (/home/daniel/posture_corrector/posture-vest/web/node_modules/next/dist/compiled/@opentelemetry/api/index.js:1:7062)
+    at ContextAPI.with (/home/daniel/posture_corrector/posture-vest/web/node_modules/next/dist/compiled/@opentelemetry/api/index.js:1:518)
+    at NoopTracer.startActiveSpan (/home/daniel/posture_corrector/posture-vest/web/node_modules/next/dist/compiled/@opentelemetry/api/index.js:1:18093)
+    at ProxyTracer.startActiveSpan (/home/daniel/posture_corrector/posture-vest/web/node_modules/next/dist/compiled/@opentelemetry/api/index.js:1:18854)
+    at /home/daniel/posture_corrector/posture-vest/web/node_modules/next/dist/server/lib/trace/tracer.js:122:103
+    at NoopContextManager.with (/home/daniel/posture_corrector/posture-vest/web/node_modules/next/dist/compiled/@opentelemetry/api/index.js:1:7062)
+    at ContextAPI.with (/home/daniel/posture_corrector/posture-vest/web/node_modules/next/dist/compiled/@opentelemetry/api/index.js:1:518)

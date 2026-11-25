@@ -1,0 +1,1211 @@
+--- a/README.md
++++ b/README.md
+@@ -31,3 +31,11 @@
+ - No wear detection. One shared password and one shared device key. Use HTTPS if you deploy.
+ - Vibration strength cap (200/255) and 30 s cooldown are placeholders to confirm with a clinician and the motor datasheet.
+ - Test EMI with the motor running (Task 1): it can disturb the I2C lines.
++
++## Review checks and file storage operation
++- Run `cd web && npm test` for isolated route tests (Node's built-in test runner; no added dependencies).
++- With the production server running, run `APP_PASSWORD=... DEVICE_KEY=... node test/http.test.mjs` for HTTP integration tests. These use synthetic data and delete the server's recorded history; use a disposable local instance.
++- All server processes must share the same working directory and persistent local filesystem. Writes use a directory lock and unique temporary files. If a process crashes with `web/data/.write-lock` present, stop every writer before removing that stale lock; waiting writes fail after two seconds.
++- Delete removes recorded hours and local backups, preserving settings and device status. Offline vest summaries can subsequently upload again; externally managed backups are outside this operation.
++- Network and calibration operations remain blocking. PWM is stopped around network and I2C operations; calibration starts and fault cues now share the existing 30-second cooldown with posture cues. A calibration sequence still includes its short acknowledgment pulses.
++- See `review/REVIEW.md`, `review/changes.diff`, and the recorded logs for evidence and remaining limitations. Next.js 14 dependencies still have audit findings; do not treat a passing build as deployment clearance.
+
+--- /dev/null
++++ b/firmware/posture_vest/http_response.h
+@@ -0,0 +1,55 @@
++#pragma once
++#include <stddef.h>
++#include <stdlib.h>
++#include <string.h>
++#include <ctype.h>
++
++// Decode a complete bounded HTTP response; never accept a partial settings body.
++inline int decodeHttp(char *raw, size_t len, char *out, size_t cap, bool closed) {
++  if (!cap) return -2;
++  out[0] = 0;
++  char *end = raw + len, *body = strstr(raw, "\r\n\r\n");
++  if (!body || strncmp(raw, "HTTP/1.", 7) || len < 12) return -2;
++  int status = atoi(raw + 9);
++  bool chunked = false; long contentLength = -1;
++  for (char *p = strstr(raw, "\r\n") + 2; p < body;) {
++    char *next = strstr(p, "\r\n");
++    if (!next) return -2;
++    // Header names and transfer coding are case insensitive.
++    for (char *q = p; q < next; ++q) *q = tolower((unsigned char)*q);
++    if (!strncmp(p, "transfer-encoding:", 18)) {
++      char *value = p + 18; while (*value == ' ') ++value;
++      if (strncmp(value, "chunked", 7) || value + 7 != next) return -2;
++      chunked = true;
++    }
++    if (!strncmp(p, "content-length:", 15)) {
++      char *value = p + 15, *tail;
++      contentLength = strtol(value, &tail, 10);
++      if (tail == value || tail != next || contentLength < 0) return -2;
++    }
++    p = next + 2;
++  }
++  body += 4;
++  size_t used = 0;
++  if (chunked) {
++    if (contentLength >= 0) return -2;
++    for (;;) {
++      char *line = strstr(body, "\r\n"), *tail;
++      if (!line || body == line || !isxdigit((unsigned char)*body)) return -2;
++      unsigned long count = strtoul(body, &tail, 16);
++      if (tail != line && *tail != ';') return -2;
++      body = line + 2;
++      if (!count) {
++        if (end - body < 2 || body[0] != '\r' || body[1] != '\n') return -2;
++        out[used] = 0; return status;
++      }
++      if (count >= cap - used || count > (size_t)(end - body) || (size_t)(end - body) - count < 2) return -2;
++      memcpy(out + used, body, count); used += count; body += count;
++      if (body[0] != '\r' || body[1] != '\n') return -2;
++      body += 2;
++    }
++  }
++  size_t count = contentLength >= 0 ? (size_t)contentLength : (size_t)(end - body);
++  if ((contentLength < 0 && !closed) || count > (size_t)(end - body) || count >= cap) return -2;
++  memcpy(out, body, count); out[count] = 0; return status;
++}
+
+--- a/firmware/posture_vest/posture_vest.ino
++++ b/firmware/posture_vest/posture_vest.ino
+@@ -18,6 +18,7 @@
+ #include <WiFiS3.h>
+ #include <EEPROM.h>
+ #include "secrets.h"
++#include "http_response.h"
+ 
+ #ifdef USE_TLS
+ WiFiSSLClient net;
+@@ -51,9 +52,9 @@
+ struct Row { uint8_t g, b, c; unsigned long closedAt; };
+ Row q[QMAX]; uint8_t qn = 0;
+ unsigned long goodMs = 0, badMs = 0, badSince = 0, minuteStart = 0, lastSample = 0, lastGoodRead = 0, lastWifiTry = 0;
+-uint8_t cues = 0; bool recalDonePending = false;
+-
+-void motorWrite(uint8_t v) { analogWrite(MOTOR_PIN, v); }
++uint8_t cues = 0; bool recalDonePending = false, badTracking = false;
++
++void motorWrite(uint8_t v) { analogWrite(MOTOR_PIN, min(v, MAX_STRENGTH)); }
+ void stopMotor() { cuePulses = 0; cueOn = false; motorWrite(0); }
+ uint8_t level() { return (uint8_t)min(max(strength, 0), (int)MAX_STRENGTH); }
+ void buzz(unsigned ms) { motorWrite(level()); delay(ms); motorWrite(0); }
+@@ -69,14 +70,26 @@
+   }
+ }
+ 
+-bool readAngles(float &pitch, float &roll) {
++bool readAccel(int16_t &x, int16_t &y, int16_t &z) {
+   Wire.beginTransmission(MPU_ADDR); Wire.write(0x3B);
+   if (Wire.endTransmission(false) != 0) return false;
+   if (Wire.requestFrom((int)MPU_ADDR, 6) != 6) return false;
+-  int16_t x = Wire.read() << 8 | Wire.read();
+-  int16_t y = Wire.read() << 8 | Wire.read();
+-  int16_t z = Wire.read() << 8 | Wire.read();
++  x = Wire.read() << 8 | Wire.read();
++  y = Wire.read() << 8 | Wire.read();
++  z = Wire.read() << 8 | Wire.read();
++  return true;
++}
++
++bool readAngles(float &pitch, float &roll) {
++  // I2C may block: keep PWM off throughout the transaction.
++  motorWrite(0);
++  int16_t x, y, z;
++  bool ok = readAccel(x, y, z);
++  if (cueOn && millis() - cueT < PULSE_MS) motorWrite(level());
++  if (!ok) return false;
+   float ax = x / 16384.0, ay = y / 16384.0, az = z / 16384.0;
++  float magnitude = ax * ax + ay * ay + az * az;
++  if (!isfinite(magnitude) || magnitude < 0.64 || magnitude > 1.44) return false;
+   if (!filterInit) { fax = ax; fay = ay; faz = az; filterInit = true; }
+   fax += 0.2 * (ax - fax); fay += 0.2 * (ay - fay); faz += 0.2 * (az - faz);
+   pitch = atan2(-fax, sqrt(fay * fay + faz * faz)) * 57.2958;
+@@ -85,7 +98,10 @@
+ }
+ 
+ bool calibrate() {
+-  stopMotor(); buzz(200); delay(2500);            // buzz, then 2.5 s to settle
++  stopMotor();
++  if (millis() - lastCue < COOLDOWN_MS) return false;
++  lastCue = millis(); badTracking = false; filterInit = false;
++  buzz(200); delay(2500);            // buzz, then 2.5 s to settle
+   float sp = 0, sr = 0, minP = 999, maxP = -999, minR = 999, maxR = -999; int n = 0;
+   unsigned long t0 = millis();
+   while (millis() - t0 < 3000) {
+@@ -93,7 +109,7 @@
+     if (readAngles(p, r)) { sp += p; sr += r; n++; minP = min(minP, p); maxP = max(maxP, p); minR = min(minR, r); maxR = max(maxR, r); }
+     delay(SAMPLE_MS);
+   }
+-  if (n < 30 || maxP - minP > 8 || maxR - minR > 8) {   // too much movement or no sensor
++  if (n < 30 || !isfinite(sp) || !isfinite(sr) || maxP - minP > 8 || maxR - minR > 8) {   // too much movement or no sensor
+     for (int i = 0; i < 3; i++) { buzz(100); delay(100); }
+     return false;
+   }
+@@ -106,7 +122,7 @@
+ void connectWiFi() {
+   if (millis() - lastWifiTry < 30000 && lastWifiTry) return;
+   lastWifiTry = millis();
+-  WiFi.begin(WIFI_SSID, WIFI_PASS);
++  stopMotor(); WiFi.begin(WIFI_SSID, WIFI_PASS);
+   unsigned long t0 = millis();
+   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) delay(200);
+ }
+@@ -120,21 +136,23 @@
+   net.print("\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: ");
+   net.print(strlen(body)); net.print("\r\n\r\n"); net.print(body);
+   size_t len = 0; unsigned long t0 = millis();
+-  while ((net.connected() || net.available()) && millis() - t0 < 5000)
+-    while (net.available() && len < sizeof raw - 1) raw[len++] = net.read();
++  while ((net.connected() || net.available()) && millis() - t0 < 5000) {
++    if (net.available()) {
++      if (len == sizeof raw - 1) { net.stop(); return -3; }
++      raw[len++] = net.read();
++    }
++  }
++  bool closed = !net.connected();
+   raw[len] = 0; net.stop();
+-  if (len < 12) return -2;
+-  int status = atoi(raw + 9);
+-  char *b = strstr(raw, "\r\n\r\n");
+-  strncpy(resp, b ? b + 4 : "", cap - 1); resp[cap - 1] = 0;
+-  return status;
++  return decodeHttp(raw, len, resp, cap, closed);
+ }
+ 
+ int getVal(const char *s, const char *key, int def) { const char *p = strstr(s, key); return p ? atoi(p + strlen(key)) : def; }
+ 
+ void sync() {
+   if (WiFi.status() != WL_CONNECTED) { connectWiFi(); if (WiFi.status() != WL_CONNECTED) return; }
+-  static char body[2000]; char resp[160];
++  stopMotor();
++  static char body[2000]; char resp[400];
+   int n = snprintf(body, sizeof body, "{\"cal\":%d,\"recalDone\":%d,\"rows\":[", calibrated, recalDonePending);
+   for (uint8_t i = 0; i < qn; i++)
+     n += snprintf(body + n, sizeof body - n, "%s{\"ago\":%lu,\"g\":%u,\"b\":%u,\"c\":%u}",
+@@ -157,38 +175,45 @@
+ }
+ 
+ void setup() {
++  analogWriteResolution(8);
+   pinMode(MOTOR_PIN, OUTPUT); motorWrite(0);
+   pinMode(BTN_PIN, INPUT_PULLUP); pinMode(LED_BUILTIN, OUTPUT);
+   Wire.begin(); Wire.beginTransmission(MPU_ADDR); Wire.write(0x6B); Wire.write(0); Wire.endTransmission();  // wake IMU
+   Cal c; EEPROM.get(0, c);
+-  if (c.magic == CAL_MAGIC) { baseP = c.pitch; baseR = c.roll; calibrated = true; }
++  if (c.magic == CAL_MAGIC && isfinite(c.pitch) && isfinite(c.roll) && fabs(c.pitch) <= 90 && fabs(c.roll) <= 180) { baseP = c.pitch; baseR = c.roll; calibrated = true; }
+   minuteStart = lastSample = millis();
++  lastCue = millis() - COOLDOWN_MS;
+   connectWiFi();
+ }
+ 
+ void loop() {
+   unsigned long now = millis();
+ 
+-  static unsigned long btnDown = 0;
+-  if (digitalRead(BTN_PIN) == LOW) { if (!btnDown) btnDown = now; else if (now - btnDown > 1500) { calibrate(); btnDown = 0; delay(500); } }
+-  else btnDown = 0;
++  static unsigned long btnDown = 0; static bool buttonHandled = false;
++  if (digitalRead(BTN_PIN) == LOW) { if (!btnDown) btnDown = now; else if (!buttonHandled && now - btnDown > 1500) { calibrate(); buttonHandled = true; } }
++  else { btnDown = 0; buttonHandled = false; }
++  now = millis();
+ 
+   updateCue();
+ 
+   if (now - lastSample >= SAMPLE_MS) {
+-    unsigned long dt = now - lastSample; lastSample = now;
++    unsigned long dt = min((unsigned long)SAMPLE_MS, now - lastSample); lastSample = now;
+     float p, r;
+     if (readAngles(p, r)) {
+       lastGoodRead = now;
+       if (calibrated && enabled) {
+         float dp = p - baseP, dr = r - baseR;
++        if (dr > 180) dr -= 360; else if (dr < -180) dr += 360;
+         if (sqrt(dp * dp + dr * dr) > tolDeg) {
+-          badMs += dt; if (!badSince) badSince = now;
++          badMs += dt; if (!badTracking) { badSince = now; badTracking = true; }
+           if (now - badSince >= delaySec * 1000UL && now - lastCue >= COOLDOWN_MS) { startCue(2); lastCue = now; cues++; }
+-        } else { goodMs += dt; badSince = 0; }
++        } else { goodMs += dt; badTracking = false; }
++      } else { badTracking = false; stopMotor(); }
++    } else {
++      badTracking = false; stopMotor();
++      if (now - lastGoodRead > 2000 && now - lastFailCue > 60000 && now - lastCue >= COOLDOWN_MS) {
++        lastFailCue = lastCue = now; buzz(1000);
+       }
+-    } else if (now - lastGoodRead > 2000 && now - lastFailCue > 60000) {
+-      lastFailCue = now; stopMotor(); buzz(1000);
+     }
+   }
+ 
+
+--- /dev/null
++++ b/review/browser-check.py
+@@ -0,0 +1,35 @@
++import urllib.request, json, time, base64, sys
++from pathlib import Path
++prefix=sys.argv[1] if len(sys.argv)>1 else 'baseline'
++def request(method,url,data=None):
++ r=urllib.request.Request(url,data=None if data is None else json.dumps(data).encode(),headers={'Content-Type':'application/json'},method=method)
++ with urllib.request.urlopen(r) as f:return json.load(f)
++session=request('POST','http://127.0.0.1:9515/session',{'capabilities':{'alwaysMatch':{'browserName':'chrome','goog:chromeOptions':{'args':['--headless=new','--no-sandbox','--disable-dev-shm-usage','--window-size=375,812']},'goog:loggingPrefs':{'browser':'ALL'}}}})['value']['sessionId']
++base='http://127.0.0.1:9515/session/'+session
++def call(method,p,data=None):return request(method,base+p,data)['value']
++def js(s):return call('POST','/execute/sync',{'script':s,'args':[]})
++def cdp(cmd,params={}):return call('POST','/goog/cdp/execute',{'cmd':cmd,'params':params})
++def shot(name):Path(__file__).with_name(prefix+'-'+name+'.png').write_bytes(base64.b64decode(call('GET','/screenshot')))
++def enter():call('POST','/actions',{'actions':[{'type':'key','id':'keyboard','actions':[{'type':'keyDown','value':'\ue007'},{'type':'keyUp','value':'\ue007'}]}]})
++try:
++ cdp('Emulation.setDeviceMetricsOverride',{'width':375,'height':812,'deviceScaleFactor':1,'mobile':True})
++ call('POST','/url',{'url':'http://127.0.0.1:3000'});time.sleep(1)
++ print('login layout',js('return {viewport:innerWidth,width:document.documentElement.scrollWidth,passwordLabel:document.querySelector("label").textContent}'))
++ shot('login')
++ el=call('POST','/element',{'using':'css selector','value':'#pw'})['element-6066-11e4-a52e-4f735466cecf']
++ call('POST','/element/'+el+'/value',{'text':'review-password'});enter();time.sleep(1)
++ print('keyboard login',js('return document.querySelector("h1").textContent'))
++ print('dashboard layout',js('return {viewport:innerWidth,width:document.documentElement.scrollWidth,controls:[...document.querySelectorAll("input")].map(x=>({id:x.id,type:x.type,labels:[...x.labels].map(l=>l.textContent)}))}'))
++ shot('dashboard')
++ height=js('return document.documentElement.scrollHeight')
++ Path(__file__).with_name(prefix+'-full.png').write_bytes(base64.b64decode(cdp('Page.captureScreenshot',{'captureBeyondViewport':True,'clip':{'x':0,'y':0,'width':375,'height':height,'scale':1}})['data']))
++ print('AX controls',[(n.get('role',{}).get('value'),n.get('name',{}).get('value')) for n in cdp('Accessibility.getFullAXTree')['nodes'] if n.get('role',{}).get('value') in ['slider','checkbox','button','image']])
++ for i in range(8):
++  call('POST','/actions',{'actions':[{'type':'key','id':'keyboard','actions':[{'type':'keyDown','value':'\ue004'},{'type':'keyUp','value':'\ue004'}]}]})
++  print('tab focus',js('return document.activeElement.id || document.activeElement.textContent'))
++ print('console',call('POST','/log',{'type':'browser'}))
++ cdp('Page.addScriptToEvaluateOnNewDocument',{'source':'Storage.prototype.getItem=function(){throw new DOMException("denied","SecurityError");};'})
++ call('POST','/refresh',{});time.sleep(1)
++ print('denied localStorage',js('return {text:document.body.innerText, width:document.documentElement.scrollWidth}'))
++ print('denied console',call('POST','/log',{'type':'browser'}))
++finally:call('DELETE','')
+
+--- /dev/null
++++ b/review/http-parser.test.cpp
+@@ -0,0 +1,32 @@
++#include "../firmware/posture_vest/http_response.h"
++#include <assert.h>
++#include <stdio.h>
++#include <string>
++#include <fstream>
++#include <iterator>
++int main(int argc, char **argv) {
++ char out[400], raw[1600];
++ auto check = [&](const std::string &s, int expected, const char *body = nullptr, bool closed = true, size_t cap = 400) {
++  strcpy(raw, s.c_str()); int result = decodeHttp(raw, s.size(), out, cap, closed); assert(result == expected); if (body) assert(!strcmp(out, body));
++ };
++ check("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nto\r\n4\r\nl=12\r\n1\r\n\n\r\n0\r\n\r\n",200,"tol=12\n",false);
++ check("HTTP/1.1 200 OK\r\ntransfer-encoding: Chunked\r\n\r\n6;ext=1\r\nen=0\nX\r\n0\r\n\r\n",200,"en=0\nX");
++ check("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nen=0",200,"en=0",false);
++ check("HTTP/1.1 200 OK\r\n\r\nen=0",200,"en=0");
++ check("HTTP/1.1 200 OK\r\n\r\nen=0",-2,nullptr,false);
++ check("HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\nen=0",-2);
++ check("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nen=0\r\n",-2);
++ check("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzzz\r\n",-2);
++ check("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nen=0",-2,nullptr,true,4);
++ check("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nen=0\r\n0\r\n\r\n",-2,nullptr,true,4);
++ check("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n0\r\n\r\n",-2);
++ check("HTTP/1.1 200 OK\r\nContent-Length: 399\r\n\r\n" + std::string(399, 'x'),200,std::string(399, 'x').c_str());
++ check("HTTP/1.1 200 OK\r\nContent-Length: 400\r\n\r\n" + std::string(400, 'x'),-2);
++ if (argc > 1) {
++  std::ifstream file(argv[1], std::ios::binary);
++  std::string captured((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
++  assert(file.good() || file.eof()); assert(!captured.empty());
++  check(captured,200,"tol=12\ndelay=4\nint=150\nen=1\nrecal=0\n");
++ }
++ puts("PASS: 13 HTTP parser cases plus captured Next.js chunked response");
++}
+
+--- a/web/app/api/config/route.js
++++ b/web/app/api/config/route.js
+@@ -1,7 +1,10 @@
+-import { load, save, authed, deny, json, clamp } from '@/lib/store';
++import { update, readBody, authed, deny, json, clamp } from '@/lib/store';
+ export async function PUT(req) {
+   if (!authed(req)) return deny();
+-  const db = load(), c = db.config, b = await req.json().catch(() => ({}));
+-  db.config = { tol: clamp(b.tol, 5, 45, c.tol), delay: clamp(b.delay, 1, 30, c.delay), int: clamp(b.int, 50, 200, c.int), en: b.en ? 1 : 0 };
+-  save(db); return json(db.config);
++  const b = await readBody(req);
++  const db = await update(db => {
++    const c = db.config;
++    db.config = { tol: clamp(b.tol, 5, 45, c.tol), delay: clamp(b.delay, 1, 30, c.delay), int: clamp(b.int, 50, 200, c.int), en: b.en ? 1 : 0 };
++  });
++  return json(db.config);
+ }
+
+--- /dev/null
++++ b/web/app/api/data/route.js
+@@ -0,0 +1,6 @@
++import { update, authed, deny, json } from '@/lib/store';
++export async function DELETE(req) {
++  if (!authed(req)) return deny();
++  await update(db => { db.hours = {}; }, true);
++  return json({ ok: true });
++}
+
+--- a/web/app/api/device/sync/route.js
++++ b/web/app/api/device/sync/route.js
+@@ -1,10 +1,12 @@
+-import { load, save, ready, same, clamp, deny, notReady } from '@/lib/store';
++import { update, readBody, ready, same, clamp, deny, notReady } from '@/lib/store';
+ // The vest posts minute summaries here and gets its current settings back as plain text.
+ export async function POST(req) {
+   if (!ready()) return notReady();
+   if (!same(req.headers.get('x-device-key') || '', process.env.DEVICE_KEY)) return deny();
+-  const b = await req.json().catch(() => ({})), db = load(), now = Date.now();
++  const b = await readBody(req), now = Date.now();
++  const db = await update(db => {
+   (Array.isArray(b.rows) ? b.rows : []).slice(0, 60).forEach(r => {
++    if (!r || typeof r !== 'object') return;
+     const t = now - clamp(r.ago, 0, 604800, 0) * 1000, h = Math.floor(t / 3600000) * 3600;   // hour bucket, epoch seconds
+     const e = db.hours[h] || (db.hours[h] = { g: 0, b: 0, c: 0 });
+     e.g += clamp(r.g, 0, 60, 0); e.b += clamp(r.b, 0, 60, 0); e.c += clamp(r.c, 0, 50, 0);
+@@ -12,7 +14,7 @@
+   if (b.recalDone) db.recal = 0;
+   db.calibrated = b.cal ? 1 : 0; db.lastSeen = now;
+   const cutoff = now / 1000 - 400 * 86400; Object.keys(db.hours).forEach(k => { if (k < cutoff) delete db.hours[k]; });
+-  save(db);
++  });
+   const c = db.config;
+-  return new Response(`tol=${c.tol}\ndelay=${c.delay}\nint=${c.int}\nen=${c.en}\nrecal=${db.recal}\n`, { headers: { 'Content-Type': 'text/plain' } });
++  return new Response(`tol=${c.tol}\ndelay=${c.delay}\nint=${c.int}\nen=${c.en}\nrecal=${db.recal}\n`, { headers: { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' } });
+ }
+
+--- a/web/app/api/export/route.js
++++ b/web/app/api/export/route.js
+@@ -2,5 +2,5 @@
+ export const dynamic = 'force-dynamic';
+ export async function GET(req) {
+   if (!authed(req)) return deny();
+-  return new Response(JSON.stringify(load()), { headers: { 'Content-Type': 'application/json', 'Content-Disposition': 'attachment; filename="posture-data.json"' } });
++  return new Response(JSON.stringify(load()), { headers: { 'Cache-Control': 'no-store', 'Content-Type': 'application/json', 'Content-Disposition': 'attachment; filename="posture-data.json"' } });
+ }
+
+--- a/web/app/api/login/route.js
++++ b/web/app/api/login/route.js
+@@ -1,7 +1,7 @@
+-import { ready, same, makeToken, json, notReady } from '@/lib/store';
++import { ready, same, makeToken, json, notReady, readBody } from '@/lib/store';
+ export async function POST(req) {
+   if (!ready()) return notReady();
+-  const b = await req.json().catch(() => ({}));
++  const b = await readBody(req);
+   if (!same(b.password || '', process.env.APP_PASSWORD)) return json({ error: 'Wrong password' }, 401);
+   return json({ token: makeToken() });
+ }
+
+--- a/web/app/api/recalibrate/route.js
++++ b/web/app/api/recalibrate/route.js
+@@ -1,5 +1,5 @@
+-import { load, save, authed, deny, json } from '@/lib/store';
++import { update, authed, deny, json } from '@/lib/store';
+ export async function POST(req) {
+   if (!authed(req)) return deny();
+-  const db = load(); db.recal = 1; save(db); return json({ ok: true });
++  await update(db => { db.recal = 1; }); return json({ ok: true });
+ }
+
+--- a/web/app/layout.js
++++ b/web/app/layout.js
+@@ -4,10 +4,6 @@
+ export default function RootLayout({ children }) {
+   return (
+     <html lang="en">
+-      <head>
+-        <link rel="preconnect" href="https://fonts.googleapis.com" />
+-        <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap" rel="stylesheet" />
+-      </head>
+       <body>{children}</body>
+     </html>
+   );
+
+--- a/web/app/page.js
++++ b/web/app/page.js
+@@ -12,7 +12,7 @@
+       {items.map((it, i) => { let y = h; return (
+         <g key={i}>
+           {it.parts.map(([v, c], j) => { const bh = v / max * h; y -= bh; return <rect key={j} x={i * w + 1.5} y={y} width={w - 3} height={bh} fill={c} />; })}
+-          {it.label !== '' && <text x={i * w + w / 2} y="112" textAnchor="middle">{it.label}</text>}
++          {it.label !== '' && <text x={i === 0 ? 0 : i === items.length - 1 ? 320 : i * w + w / 2} y="112" textAnchor={i === 0 ? 'start' : i === items.length - 1 ? 'end' : 'middle'}>{it.label}</text>}
+         </g>); })}
+     </svg>
+   );
+@@ -25,13 +25,14 @@
+   const [form, setForm] = useState({ tol: 12, delay: 4, int: 150, en: true });
+   const formLoaded = useRef(false);
+ 
+-  useEffect(() => { setToken(localStorage.getItem('pv_token') || ''); }, []);
+-  const signOut = () => { localStorage.removeItem('pv_token'); formLoaded.current = false; setToken(''); };
++  useEffect(() => { try { setToken(localStorage.getItem('pv_token') || ''); } catch { setToken(''); } }, []);
++  const signOut = () => { try { localStorage.removeItem('pv_token'); } catch {} formLoaded.current = false; setToken(''); };
+   const flash = t => { setMsg(t); setTimeout(() => setMsg(''), 3500); };
+ 
+   const api = useCallback(async (method, url, body) => {
+     const r = await fetch(url, { method, headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token }, body: body ? JSON.stringify(body) : undefined });
+     if (r.status === 401) { signOut(); throw new Error('auth'); }
++    if (!r.ok) throw new Error('Request failed (' + r.status + ')');
+     return r;
+   }, [token]);
+ 
+@@ -40,21 +41,23 @@
+       const [h, s] = await Promise.all([api('GET', '/api/hours?days=15').then(r => r.json()), api('GET', '/api/status').then(r => r.json())]);
+       setHours(h); setStatus(s);
+       if (!formLoaded.current) { setForm({ ...s.config, en: !!s.config.en }); formLoaded.current = true; }   // never overwrite unsaved edits
+-    } catch {}
++    } catch (error) { if (error.message !== 'auth') setMsg('Could not load data. Please retry.'); }
+   }, [api]);
+ 
+   useEffect(() => { if (token) { load(); const i = setInterval(load, 60000); return () => clearInterval(i); } }, [token, load]);
+ 
++  const action = fn => async () => { try { await fn(); } catch (error) { if (error.message !== 'auth') flash('Request failed. Please retry.'); } };
++
+   async function login() {
+     const r = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: pw }) });
+-    if (!r.ok) { setLoginErr('That password is not right.'); return; }
+-    const { token: t } = await r.json(); localStorage.setItem('pv_token', t); setPw(''); setLoginErr(''); setToken(t);
++    if (!r.ok) { setLoginErr(r.status === 401 ? 'That password is not right.' : 'Sign in failed. Please retry.'); return; }
++    const { token: t } = await r.json(); try { localStorage.setItem('pv_token', t); } catch {} setPw(''); setLoginErr(''); setToken(t);
+   }
+ 
+   const { today, tg, tb, days } = useMemo(() => {
+     const mid = new Date(); mid.setHours(0, 0, 0, 0); const m0 = mid.getTime() / 1000;
+     const today = Array.from({ length: 24 }, () => ({ g: 0, b: 0 }));
+-    hours.filter(h => h.t >= m0).forEach(h => { const i = Math.floor((h.t - m0) / 3600); if (today[i]) { today[i].g += h.g; today[i].b += h.b; } });
++    hours.filter(h => h.t >= m0).forEach(h => { const i = new Date(h.t * 1000).getHours(); if (today[i]) { today[i].g += h.g; today[i].b += h.b; } });
+     const byDay = {}; hours.forEach(h => { const k = dayKey(h.t); byDay[k] = byDay[k] || { g: 0, b: 0 }; byDay[k].g += h.g; byDay[k].b += h.b; });
+     const days = []; for (let i = 13; i >= 0; i--) { const d = new Date(); d.setDate(d.getDate() - i); const x = byDay[dayKey(d / 1000)];
+       days.push({ label: d.getDate(), pct: x && x.g + x.b > 300 ? x.g / (x.g + x.b) : 0 }); }
+@@ -66,9 +69,11 @@
+     <main>
+       <h1>Posture progress</h1>
+       <p className="muted">Enter the password for this vest.</p>
++      <form onSubmit={e => { e.preventDefault(); action(login)(); }}>
+       <label htmlFor="pw" className="muted">Password</label>
+-      <input id="pw" type="password" autoComplete="current-password" value={pw} onChange={e => setPw(e.target.value)} onKeyDown={e => e.key === 'Enter' && login()} />
+-      <button onClick={login}>Sign in</button>
++      <input id="pw" type="password" autoComplete="current-password" value={pw} onChange={e => setPw(e.target.value)} />
++      <button type="submit">Sign in</button>
++      </form>
+       <p role="alert" className="err">{loginErr}</p>
+     </main>
+   );
+@@ -76,36 +81,36 @@
+   const set = k => e => setForm({ ...form, [k]: e.target.type === 'checkbox' ? e.target.checked : +e.target.value });
+   const save = async () => { await api('PUT', '/api/config', form); flash('Settings saved. The vest picks them up within a minute.'); };
+   const recal = async () => { await api('POST', '/api/recalibrate'); flash('Recalibration requested. Get into your target posture and hold still.'); load(); };
+-  const exportData = async () => { const b = await (await api('GET', '/api/export')).blob(); const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'posture-data.json'; a.click(); };
++  const exportData = async () => { const b = await (await api('GET', '/api/export')).blob(); const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'posture-data.json'; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); };
+   const wipe = async () => { if (confirm('Delete all recorded posture data? This cannot be undone.')) { await api('DELETE', '/api/data'); flash('All data deleted.'); load(); } };
+ 
+   return (
+     <main>
+       <h1>Today</h1>
+-      <p>{tg + tb < 60 ? 'No worn time recorded yet today.' : `You held your target posture for ${Math.round(tg / (tg + tb) * 100)}% of ${Math.round((tg + tb) / 60)} minutes worn.`}</p>
+-      <Bars label="Posture by hour today" max={3600} items={today.map((x, i) => ({ label: i % 6 === 0 ? i + ':00' : '', parts: [[x.g, 'var(--good)'], [x.b, 'var(--bad)']] }))} />
++      <p>{tg + tb < 60 ? 'No tracked time recorded yet today.' : `You held your target posture for ${Math.round(tg / (tg + tb) * 100)}% of ${Math.round((tg + tb) / 60)} minutes tracked.`}</p>
++      <Bars label={'Posture by hour today: ' + today.map((x, i) => i + ':00, target ' + x.g + ' seconds, outside ' + x.b + ' seconds').join('; ')} max={3600} items={today.map((x, i) => ({ label: i % 6 === 0 ? i + ':00' : '', parts: [[x.g, 'var(--good)'], [x.b, 'var(--bad)']] }))} />
+       <p className="muted"><span className="swatch" style={{ background: 'var(--good)' }} />Target posture <span className="swatch" style={{ background: 'var(--bad)', marginLeft: 14 }} />Outside target</p>
+ 
+       <h2>Last 14 days</h2>
+-      <p className="muted">Share of worn time spent in your target posture each day.</p>
++      <p className="muted">Share of tracked time spent in your target posture each day.</p>
+       <Bars label={'Daily posture: ' + days.map(d => d.label + ': ' + Math.round(d.pct * 100) + '%').join(', ')} max={100} items={days.map(d => ({ label: d.label, parts: [[d.pct * 100, 'var(--good)']] }))} />
+ 
+       <h2>Vest</h2>
+       <p>{status ? (status.lastSeen ? 'Last heard from the vest ' + ago(status.lastSeen) + '. ' : 'The vest has not connected yet. ') + (status.calibrated ? 'It is calibrated.' : 'It is not calibrated yet.') + (status.recal ? ' Recalibration is waiting for the vest to check in (up to a minute).' : '') : ''}</p>
+-      <div className="btns"><button className="alt" onClick={recal}>Recalibrate vest</button></div>
+-      <p className="muted" style={{ marginTop: 8 }}>Sit or stand in your best comfortable posture, then press the button. The vest buzzes once, then waits about 3 seconds while it records.</p>
++      <div className="btns"><button className="alt" onClick={action(recal)}>Recalibrate vest</button></div>
++      <p className="muted" style={{ marginTop: 8 }}>Sit or stand in your best comfortable posture, then press the button. The vest buzzes once, waits 2.5 seconds for you to settle, then records for 3 seconds. Calibration may wait for the 30-second cooldown.</p>
+ 
+       <h2>Settings</h2>
+       <div className="row"><label htmlFor="tol">Allowed movement <output>{form.tol} degrees</output></label><input id="tol" type="range" min="5" max="45" value={form.tol} onChange={set('tol')} /></div>
+       <div className="row"><label htmlFor="delay">Wait before buzzing <output>{form.delay} seconds</output></label><input id="delay" type="range" min="1" max="30" value={form.delay} onChange={set('delay')} /></div>
+       <div className="row"><label htmlFor="int">Buzz strength <output>{Math.round(form.int / 2.55)}%</output></label><input id="int" type="range" min="50" max="200" value={form.int} onChange={set('int')} /></div>
+       <div className="row"><label><span>Buzzing on</span><input type="checkbox" checked={form.en} onChange={set('en')} /></label></div>
+-      <div className="btns"><button onClick={save}>Save settings</button></div>
++      <div className="btns"><button onClick={action(save)}>Save settings</button></div>
+       <p className="msg" role="status">{msg}</p>
+ 
+       <h2>Your data</h2>
+-      <p className="muted">Only hourly totals are stored: time in and out of target posture, and number of buzzes. No name, location, or raw movement.</p>
+-      <div className="btns"><button className="alt" onClick={exportData}>Download my data</button><button className="danger" onClick={wipe}>Delete all data</button><button className="alt" onClick={signOut}>Sign out</button></div>
++      <p className="muted">Posture history contains hourly totals of time in and out of target posture and number of buzzes. Settings, calibration status, and the last connection time are also stored. No name, location, or raw movement.</p>
++      <div className="btns"><button className="alt" onClick={action(exportData)}>Download my data</button><button className="danger" onClick={action(wipe)}>Delete all data</button><button className="alt" onClick={signOut}>Sign out</button></div>
+     </main>
+   );
+ }
+
+--- a/web/lib/store.js
++++ b/web/lib/store.js
+@@ -7,19 +7,46 @@
+ 
+ // Read from disk on every request so separate route bundles never see stale data.
+ export function load() {
+-  try { return { ...DEFAULT, ...JSON.parse(fs.readFileSync(FILE, 'utf8')) }; } catch { return structuredClone(DEFAULT); }
++  try { return { ...DEFAULT, ...JSON.parse(fs.readFileSync(FILE, 'utf8')) }; } catch (error) { if (error.code === 'ENOENT') return structuredClone(DEFAULT); throw error; }
+ }
+ export function save(db) {            // atomic write, plus one backup copy per day (last 7 kept)
+   fs.mkdirSync(BK, { recursive: true });
+-  fs.writeFileSync(FILE + '.tmp', JSON.stringify(db)); fs.renameSync(FILE + '.tmp', FILE);
++  const tmp = FILE + '.' + crypto.randomUUID() + '.tmp';
++  try { fs.writeFileSync(tmp, JSON.stringify(db), { mode: 0o600 }); fs.renameSync(tmp, FILE); }
++  finally { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); }
+   const bk = path.join(BK, new Date().toISOString().slice(0, 10) + '.json');
+   if (!fs.existsSync(bk)) { fs.copyFileSync(FILE, bk); fs.readdirSync(BK).sort().slice(0, -7).forEach(f => fs.unlinkSync(path.join(BK, f))); }
+ }
+ 
++// A disk lock protects the complete read/modify/write across route bundles/processes.
++// A crash leaves the lock in place: remove it only after stopping every writer.
++export async function update(change, purgeBackups = false) {
++  fs.mkdirSync(DATA, { recursive: true });
++  const lock = path.join(DATA, '.write-lock'), deadline = Date.now() + 2000;
++  for (;;) {
++    try { fs.mkdirSync(lock); break; }
++    catch (error) {
++      if (error.code !== 'EEXIST' || Date.now() >= deadline) throw error;
++      await new Promise(resolve => setTimeout(resolve, 10));
++    }
++  }
++  try {
++    const db = load(); change(db);
++    if (purgeBackups && fs.existsSync(BK)) {
++      for (const file of fs.readdirSync(BK)) fs.unlinkSync(path.join(BK, file));
++    }
++    save(db); return db;
++  } finally { fs.rmdirSync(lock); }
++}
++export const readBody = async req => {
++  const body = await req.json().catch(() => null);
++  return body && typeof body === 'object' && !Array.isArray(body) ? body : {};
++};
++
+ export const ready = () => Boolean(process.env.APP_PASSWORD && process.env.DEVICE_KEY);
+ export const same = (a, b) => { a = Buffer.from(String(a)); b = Buffer.from(String(b)); return a.length === b.length && crypto.timingSafeEqual(a, b); };
+-export const clamp = (v, lo, hi, d) => { v = Number(v); return Number.isFinite(v) ? Math.min(hi, Math.max(lo, Math.round(v))) : d; };
+-export const json = (data, status = 200) => Response.json(data, { status });
++export const clamp = (v, lo, hi, d) => { if (v === null || v === undefined || v === '') return d; v = Number(v); return Number.isFinite(v) ? Math.min(hi, Math.max(lo, Math.round(v))) : d; };
++export const json = (data, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store' } });
+ export const deny = () => new Response(null, { status: 401 });
+ export const notReady = () => json({ error: 'Set APP_PASSWORD and DEVICE_KEY on the server.' }, 500);
+ 
+@@ -29,6 +56,8 @@
+ export function makeToken() { const exp = Date.now() + 7 * 864e5; return exp + '.' + sign(exp); }
+ export function authed(req) {
+   if (!ready()) return false;
+-  const [exp, sig] = (req.headers.get('authorization') || '').replace('Bearer ', '').split('.');
++  const match = /^Bearer ([0-9]+)\.([a-f0-9]{64})$/.exec(req.headers.get('authorization') || '');
++  if (!match) return false;
++  const [, exp, sig] = match;
+   return Boolean(exp && sig && Number(exp) > Date.now() && same(sig, sign(exp)));
+ }
+
+--- /dev/null
++++ b/web/package-lock.json
+@@ -0,0 +1,438 @@
++{
++  "name": "posture-vest-web",
++  "version": "1.0.0",
++  "lockfileVersion": 3,
++  "requires": true,
++  "packages": {
++    "": {
++      "name": "posture-vest-web",
++      "version": "1.0.0",
++      "dependencies": {
++        "next": "^14.2.15",
++        "react": "^18.3.1",
++        "react-dom": "^18.3.1"
++      }
++    },
++    "node_modules/@next/env": {
++      "version": "14.2.35",
++      "resolved": "https://registry.npmjs.org/@next/env/-/env-14.2.35.tgz",
++      "integrity": "sha512-DuhvCtj4t9Gwrx80dmz2F4t/zKQ4ktN8WrMwOuVzkJfBilwAwGr6v16M5eI8yCuZ63H9TTuEU09Iu2HqkzFPVQ==",
++      "license": "MIT"
++    },
++    "node_modules/@next/swc-darwin-arm64": {
++      "version": "14.2.33",
++      "resolved": "https://registry.npmjs.org/@next/swc-darwin-arm64/-/swc-darwin-arm64-14.2.33.tgz",
++      "integrity": "sha512-HqYnb6pxlsshoSTubdXKu15g3iivcbsMXg4bYpjL2iS/V6aQot+iyF4BUc2qA/J/n55YtvE4PHMKWBKGCF/+wA==",
++      "cpu": [
++        "arm64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "engines": {
++        "node": ">= 10"
++      }
++    },
++    "node_modules/@next/swc-darwin-x64": {
++      "version": "14.2.33",
++      "resolved": "https://registry.npmjs.org/@next/swc-darwin-x64/-/swc-darwin-x64-14.2.33.tgz",
++      "integrity": "sha512-8HGBeAE5rX3jzKvF593XTTFg3gxeU4f+UWnswa6JPhzaR6+zblO5+fjltJWIZc4aUalqTclvN2QtTC37LxvZAA==",
++      "cpu": [
++        "x64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "engines": {
++        "node": ">= 10"
++      }
++    },
++    "node_modules/@next/swc-linux-arm64-gnu": {
++      "version": "14.2.33",
++      "resolved": "https://registry.npmjs.org/@next/swc-linux-arm64-gnu/-/swc-linux-arm64-gnu-14.2.33.tgz",
++      "integrity": "sha512-JXMBka6lNNmqbkvcTtaX8Gu5by9547bukHQvPoLe9VRBx1gHwzf5tdt4AaezW85HAB3pikcvyqBToRTDA4DeLw==",
++      "cpu": [
++        "arm64"
++      ],
++      "libc": [
++        "glibc"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 10"
++      }
++    },
++    "node_modules/@next/swc-linux-arm64-musl": {
++      "version": "14.2.33",
++      "resolved": "https://registry.npmjs.org/@next/swc-linux-arm64-musl/-/swc-linux-arm64-musl-14.2.33.tgz",
++      "integrity": "sha512-Bm+QulsAItD/x6Ih8wGIMfRJy4G73tu1HJsrccPW6AfqdZd0Sfm5Imhgkgq2+kly065rYMnCOxTBvmvFY1BKfg==",
++      "cpu": [
++        "arm64"
++      ],
++      "libc": [
++        "musl"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 10"
++      }
++    },
++    "node_modules/@next/swc-linux-x64-gnu": {
++      "version": "14.2.33",
++      "resolved": "https://registry.npmjs.org/@next/swc-linux-x64-gnu/-/swc-linux-x64-gnu-14.2.33.tgz",
++      "integrity": "sha512-FnFn+ZBgsVMbGDsTqo8zsnRzydvsGV8vfiWwUo1LD8FTmPTdV+otGSWKc4LJec0oSexFnCYVO4hX8P8qQKaSlg==",
++      "cpu": [
++        "x64"
++      ],
++      "libc": [
++        "glibc"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 10"
++      }
++    },
++    "node_modules/@next/swc-linux-x64-musl": {
++      "version": "14.2.33",
++      "resolved": "https://registry.npmjs.org/@next/swc-linux-x64-musl/-/swc-linux-x64-musl-14.2.33.tgz",
++      "integrity": "sha512-345tsIWMzoXaQndUTDv1qypDRiebFxGYx9pYkhwY4hBRaOLt8UGfiWKr9FSSHs25dFIf8ZqIFaPdy5MljdoawA==",
++      "cpu": [
++        "x64"
++      ],
++      "libc": [
++        "musl"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 10"
++      }
++    },
++    "node_modules/@next/swc-win32-arm64-msvc": {
++      "version": "14.2.33",
++      "resolved": "https://registry.npmjs.org/@next/swc-win32-arm64-msvc/-/swc-win32-arm64-msvc-14.2.33.tgz",
++      "integrity": "sha512-nscpt0G6UCTkrT2ppnJnFsYbPDQwmum4GNXYTeoTIdsmMydSKFz9Iny2jpaRupTb+Wl298+Rh82WKzt9LCcqSQ==",
++      "cpu": [
++        "arm64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "win32"
++      ],
++      "engines": {
++        "node": ">= 10"
++      }
++    },
++    "node_modules/@next/swc-win32-ia32-msvc": {
++      "version": "14.2.33",
++      "resolved": "https://registry.npmjs.org/@next/swc-win32-ia32-msvc/-/swc-win32-ia32-msvc-14.2.33.tgz",
++      "integrity": "sha512-pc9LpGNKhJ0dXQhZ5QMmYxtARwwmWLpeocFmVG5Z0DzWq5Uf0izcI8tLc+qOpqxO1PWqZ5A7J1blrUIKrIFc7Q==",
++      "cpu": [
++        "ia32"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "win32"
++      ],
++      "engines": {
++        "node": ">= 10"
++      }
++    },
++    "node_modules/@next/swc-win32-x64-msvc": {
++      "version": "14.2.33",
++      "resolved": "https://registry.npmjs.org/@next/swc-win32-x64-msvc/-/swc-win32-x64-msvc-14.2.33.tgz",
++      "integrity": "sha512-nOjfZMy8B94MdisuzZo9/57xuFVLHJaDj5e/xrduJp9CV2/HrfxTRH2fbyLe+K9QT41WBLUd4iXX3R7jBp0EUg==",
++      "cpu": [
++        "x64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "win32"
++      ],
++      "engines": {
++        "node": ">= 10"
++      }
++    },
++    "node_modules/@swc/counter": {
++      "version": "0.1.3",
++      "resolved": "https://registry.npmjs.org/@swc/counter/-/counter-0.1.3.tgz",
++      "integrity": "sha512-e2BR4lsJkkRlKZ/qCHPw9ZaSxc0MVUd7gtbtaB7aMvHeJVYe8sOB8DBZkP2DtISHGSku9sCK6T6cnY0CtXrOCQ==",
++      "license": "Apache-2.0"
++    },
++    "node_modules/@swc/helpers": {
++      "version": "0.5.5",
++      "resolved": "https://registry.npmjs.org/@swc/helpers/-/helpers-0.5.5.tgz",
++      "integrity": "sha512-KGYxvIOXcceOAbEk4bi/dVLEK9z8sZ0uBB3Il5b1rhfClSpcX0yfRO0KmTkqR2cnQDymwLB+25ZyMzICg/cm/A==",
++      "license": "Apache-2.0",
++      "dependencies": {
++        "@swc/counter": "^0.1.3",
++        "tslib": "^2.4.0"
++      }
++    },
++    "node_modules/busboy": {
++      "version": "1.6.0",
++      "resolved": "https://registry.npmjs.org/busboy/-/busboy-1.6.0.tgz",
++      "integrity": "sha512-8SFQbg/0hQ9xy3UNTB0YEnsNBbWfhf7RtnzpL7TkBiTBRfrQ9Fxcnz7VJsleJpyp6rVLvXiuORqjlHi5q+PYuA==",
++      "dependencies": {
++        "streamsearch": "^1.1.0"
++      },
++      "engines": {
++        "node": ">=10.16.0"
++      }
++    },
++    "node_modules/caniuse-lite": {
++      "version": "1.0.30001820",
++      "resolved": "https://registry.npmjs.org/caniuse-lite/-/caniuse-lite-1.0.30001820.tgz",
++      "integrity": "sha512-gfWD6MxqVCqAOwmODfZf7DchWvlrA+SRdNX7ceLfg3xRqe5ssjjpF7EgslC/0tiLiNTajdaNN/q8c/5u/7Gz8w==",
++      "funding": [
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/browserslist"
++        },
++        {
++          "type": "tidelift",
++          "url": "https://tidelift.com/funding/github/npm/caniuse-lite"
++        },
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "license": "CC-BY-4.0"
++    },
++    "node_modules/client-only": {
++      "version": "0.0.1",
++      "resolved": "https://registry.npmjs.org/client-only/-/client-only-0.0.1.tgz",
++      "integrity": "sha512-IV3Ou0jSMzZrd3pZ48nLkT9DA7Ag1pnPzaiQhpW7c3RbcqqzvzzVu+L8gfqMp/8IM2MQtSiqaCxrrcfu8I8rMA==",
++      "license": "MIT"
++    },
++    "node_modules/graceful-fs": {
++      "version": "4.2.11",
++      "resolved": "https://registry.npmjs.org/graceful-fs/-/graceful-fs-4.2.11.tgz",
++      "integrity": "sha512-RbJ5/jmFcNNCcDV5o9eTnBLJ/HszWV0P73bc+Ff4nS/rJj+YaS6IGyiOL0VoBYX+l1Wrl3k63h/KrH+nhJ0XvQ==",
++      "license": "ISC"
++    },
++    "node_modules/js-tokens": {
++      "version": "4.0.0",
++      "resolved": "https://registry.npmjs.org/js-tokens/-/js-tokens-4.0.0.tgz",
++      "integrity": "sha512-RdJUflcE3cUzKiMqQgsCu06FPu9UdIJO0beYbPhHN4k6apgJtifcoCtT9bcxOpYBtpD2kCM6Sbzg4CausW/PKQ==",
++      "license": "MIT"
++    },
++    "node_modules/loose-envify": {
++      "version": "1.4.0",
++      "resolved": "https://registry.npmjs.org/loose-envify/-/loose-envify-1.4.0.tgz",
++      "integrity": "sha512-lyuxPGr/Wfhrlem2CL/UcnUc1zcqKAImBDzukY7Y5F/yQiNdko6+fRLevlw1HgMySw7f611UIY408EtxRSoK3Q==",
++      "license": "MIT",
++      "dependencies": {
++        "js-tokens": "^3.0.0 || ^4.0.0"
++      },
++      "bin": {
++        "loose-envify": "cli.js"
++      }
++    },
++    "node_modules/nanoid": {
++      "version": "3.3.20",
++      "resolved": "https://registry.npmjs.org/nanoid/-/nanoid-3.3.20.tgz",
++      "integrity": "sha512-uKdg2G3GNCKQn9byYOpxbGqrT2fGO5KRt5J/8b3pok8rT6qxGWF6hxMyJiEYtAf+FVyYuD9hRaDqX5uPFYJ4ZQ==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "license": "MIT",
++      "bin": {
++        "nanoid": "bin/nanoid.cjs"
++      },
++      "engines": {
++        "node": "^10 || ^12 || ^13.7 || ^14 || >=15.0.1"
++      }
++    },
++    "node_modules/next": {
++      "version": "14.2.35",
++      "resolved": "https://registry.npmjs.org/next/-/next-14.2.35.tgz",
++      "integrity": "sha512-KhYd2Hjt/O1/1aZVX3dCwGXM1QmOV4eNM2UTacK5gipDdPN/oHHK/4oVGy7X8GMfPMsUTUEmGlsy0EY1YGAkig==",
++      "license": "MIT",
++      "dependencies": {
++        "@next/env": "14.2.35",
++        "@swc/helpers": "0.5.5",
++        "busboy": "1.6.0",
++        "caniuse-lite": "^1.0.30001579",
++        "graceful-fs": "^4.2.11",
++        "postcss": "8.4.31",
++        "styled-jsx": "5.1.1"
++      },
++      "bin": {
++        "next": "dist/bin/next"
++      },
++      "engines": {
++        "node": ">=18.17.0"
++      },
++      "optionalDependencies": {
++        "@next/swc-darwin-arm64": "14.2.33",
++        "@next/swc-darwin-x64": "14.2.33",
++        "@next/swc-linux-arm64-gnu": "14.2.33",
++        "@next/swc-linux-arm64-musl": "14.2.33",
++        "@next/swc-linux-x64-gnu": "14.2.33",
++        "@next/swc-linux-x64-musl": "14.2.33",
++        "@next/swc-win32-arm64-msvc": "14.2.33",
++        "@next/swc-win32-ia32-msvc": "14.2.33",
++        "@next/swc-win32-x64-msvc": "14.2.33"
++      },
++      "peerDependencies": {
++        "@opentelemetry/api": "^1.1.0",
++        "@playwright/test": "^1.41.2",
++        "react": "^18.2.0",
++        "react-dom": "^18.2.0",
++        "sass": "^1.3.0"
++      },
++      "peerDependenciesMeta": {
++        "@opentelemetry/api": {
++          "optional": true
++        },
++        "@playwright/test": {
++          "optional": true
++        },
++        "sass": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/picocolors": {
++      "version": "1.1.1",
++      "resolved": "https://registry.npmjs.org/picocolors/-/picocolors-1.1.1.tgz",
++      "integrity": "sha512-xceH2snhtb5M9liqDsmEw56le376mTZkEX/jEb/RxNFyegNul7eNslCXP9FDj/Lcu0X8KEyMceP2ntpaHrDEVA==",
++      "license": "ISC"
++    },
++    "node_modules/postcss": {
++      "version": "8.4.31",
++      "resolved": "https://registry.npmjs.org/postcss/-/postcss-8.4.31.tgz",
++      "integrity": "sha512-PS08Iboia9mts/2ygV3eLpY5ghnUcfLV/EXTOW1E2qYxJKGGBUtNjN76FYHnMs36RmARn41bC0AZmn+rR0OVpQ==",
++      "funding": [
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/postcss/"
++        },
++        {
++          "type": "tidelift",
++          "url": "https://tidelift.com/funding/github/npm/postcss"
++        },
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "nanoid": "^3.3.6",
++        "picocolors": "^1.0.0",
++        "source-map-js": "^1.0.2"
++      },
++      "engines": {
++        "node": "^10 || ^12 || >=14"
++      }
++    },
++    "node_modules/react": {
++      "version": "18.3.1",
++      "resolved": "https://registry.npmjs.org/react/-/react-18.3.1.tgz",
++      "integrity": "sha512-wS+hAgJShR0KhEvPJArfuPVN1+Hz1t0Y6n5jLrGQbkb4urgPE/0Rve+1kMB1v/oWgHgm4WIcV+i7F2pTVj+2iQ==",
++      "license": "MIT",
++      "dependencies": {
++        "loose-envify": "^1.1.0"
++      },
++      "engines": {
++        "node": ">=0.10.0"
++      }
++    },
++    "node_modules/react-dom": {
++      "version": "18.3.1",
++      "resolved": "https://registry.npmjs.org/react-dom/-/react-dom-18.3.1.tgz",
++      "integrity": "sha512-5m4nQKp+rZRb09LNH59GM4BxTh9251/ylbKIbpe7TpGxfJ+9kv6BLkLBXIjjspbgbnIBNqlI23tRnTWT0snUIw==",
++      "license": "MIT",
++      "dependencies": {
++        "loose-envify": "^1.1.0",
++        "scheduler": "^0.23.2"
++      },
++      "peerDependencies": {
++        "react": "^18.3.1"
++      }
++    },
++    "node_modules/scheduler": {
++      "version": "0.23.2",
++      "resolved": "https://registry.npmjs.org/scheduler/-/scheduler-0.23.2.tgz",
++      "integrity": "sha512-UOShsPwz7NrMUqhR6t0hWjFduvOzbtv7toDH1/hIrfRNIDBnnBWd0CwJTGvTpngVlmwGCdP9/Zl/tVrDqcuYzQ==",
++      "license": "MIT",
++      "dependencies": {
++        "loose-envify": "^1.1.0"
++      }
++    },
++    "node_modules/source-map-js": {
++      "version": "1.2.2",
++      "resolved": "https://registry.npmjs.org/source-map-js/-/source-map-js-1.2.2.tgz",
++      "integrity": "sha512-KGj/8Y43x35aZVDtt+J4mK1hoLGHULMYfSkODJNQjNDC3oW1PqPoxMwo0pLUsWM/UEGzON/NxeHywEfNXNP3Vw==",
++      "license": "BSD-3-Clause",
++      "engines": {
++        "node": ">=0.10.0"
++      }
++    },
++    "node_modules/streamsearch": {
++      "version": "1.1.0",
++      "resolved": "https://registry.npmjs.org/streamsearch/-/streamsearch-1.1.0.tgz",
++      "integrity": "sha512-Mcc5wHehp9aXz1ax6bZUyY5afg9u2rv5cqQI3mRrYkGC8rW2hM02jWuwjtL++LS5qinSyhj2QfLyNsuc+VsExg==",
++      "engines": {
++        "node": ">=10.0.0"
++      }
++    },
++    "node_modules/styled-jsx": {
++      "version": "5.1.1",
++      "resolved": "https://registry.npmjs.org/styled-jsx/-/styled-jsx-5.1.1.tgz",
++      "integrity": "sha512-pW7uC1l4mBZ8ugbiZrcIsiIvVx1UmTfw7UkC3Um2tmfUq9Bhk8IiyEIPl6F8agHgjzku6j0xQEZbfA5uSgSaCw==",
++      "license": "MIT",
++      "dependencies": {
++        "client-only": "0.0.1"
++      },
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "peerDependencies": {
++        "react": ">= 16.8.0 || 17.x.x || ^18.0.0-0"
++      },
++      "peerDependenciesMeta": {
++        "@babel/core": {
++          "optional": true
++        },
++        "babel-plugin-macros": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/tslib": {
++      "version": "2.9.1",
++      "resolved": "https://registry.npmjs.org/tslib/-/tslib-2.9.1.tgz",
++      "integrity": "sha512-a4Ux9VKuIMHsOS7ENbEq6hK2ZGYIT27Rtl0E4eD9KqwxhKiQeMZE/9xb3IdYwWaSOyIBQLExhQgXDTYoiCxnWA==",
++      "license": "0BSD"
++    }
++  }
++}
+
+--- a/web/package.json
++++ b/web/package.json
+@@ -1,3 +1,3 @@
+ { "name": "posture-vest-web", "version": "1.0.0", "private": true,
+-  "scripts": { "dev": "next dev", "build": "next build", "start": "next start" },
++  "scripts": { "dev": "next dev", "build": "next build", "start": "next start", "test": "node test/routes.test.mjs" },
+   "dependencies": { "next": "^14.2.15", "react": "^18.3.1", "react-dom": "^18.3.1" } }
+
+--- /dev/null
++++ b/web/test/http.test.mjs
+@@ -0,0 +1,39 @@
++import {test} from 'node:test';
++import assert from 'node:assert/strict';
++import crypto from 'node:crypto';
++const base=process.env.TEST_URL || 'http://127.0.0.1:3000';
++const password=process.env.APP_PASSWORD, key=process.env.DEVICE_KEY;
++let token;
++async function req(route,method='GET',body,auth=token,deviceKey) {
++ return fetch(base+'/api/'+route,{method,headers:{'content-type':'application/json',...(auth?{authorization:'Bearer '+auth}:{}),...(deviceKey?{'x-device-key':deviceKey}:{})},body:body===undefined?undefined:JSON.stringify(body)});
++}
++const device=b=>req('device/sync','POST',b,null,key);
++test('production login, wrong password, forged and expired auth on every protected route',async()=>{
++ assert.equal((await req('login','POST',{password:'wrong'},null)).status,401);
++ const r=await req('login','POST',{password},null);assert.equal(r.status,200);token=(await r.json()).token;
++ const exp=Date.now()-1000, secret=process.env.SESSION_SECRET || key+'|'+password;
++ const expired=exp+'.'+crypto.createHmac('sha256',secret).update(String(exp)).digest('hex');
++ for(const [route,method] of [['config','PUT'],['hours','GET'],['status','GET'],['export','GET'],['recalibrate','POST'],['data','DELETE']]) {
++  for(const auth of [null,'forged',expired,token+'.extra'])assert.equal((await req(route,method,undefined,auth)).status,401,route);
++ }
++});
++test('production device key, clamp, live uncached status, hourly upload and calibration',async()=>{
++ assert.equal((await req('device/sync','POST',{},null,'wrong')).status,401);
++ assert.equal((await req('data','DELETE')).status,200);
++ let r=await req('config','PUT',{tol:999,delay:-9,int:999,en:true});assert.deepEqual(await r.json(),{tol:45,delay:1,int:200,en:1});
++ const status=await req('status');assert.match(status.headers.get('cache-control'),/no-store/);assert.equal((await status.json()).config.int,200);
++ assert.equal((await req('recalibrate','POST')).status,200);
++ r=await device({cal:0,rows:[{ago:3700,g:30,b:30,c:1}]});assert.equal(r.status,200);assert.match(await r.text(),/recal=1/);
++ console.log('sync Transfer-Encoding:',r.headers.get('transfer-encoding'),'Content-Length:',r.headers.get('content-length'));
++ assert.match(await (await device({cal:1,recalDone:1})).text(),/recal=0/);
++ const hours=await (await req('hours')).json();assert.equal(hours.length,1);assert.equal(hours[0].g,30);assert.ok(Math.abs(hours[0].t-Math.floor((Date.now()-3700e3)/36e5)*3600)<=3600);
++ const after=await (await req('status')).json();assert.equal(after.recal,0);assert.equal(after.calibrated,1);
++});
++test('production concurrent uploads, export and delete',async()=>{
++ assert.equal((await req('data','DELETE')).status,200);
++ const replies=await Promise.all(Array.from({length:25},()=>device({rows:[{g:1,b:1,c:1}]})));assert.ok(replies.every(r=>r.status===200));
++ const exported=await req('export');assert.match(exported.headers.get('content-disposition'),/attachment/);const db=await exported.json();assert.equal(Object.values(db.hours).reduce((n,h)=>n+h.g,0),25);
++ assert.deepEqual(Object.keys(db).sort(),['calibrated','config','hours','lastSeen','recal']);
++ assert.equal((await req('data','DELETE')).status,200);assert.deepEqual(await (await req('hours')).json(),[]);
++ await req('config','PUT',{tol:12,delay:4,int:150,en:true});
++});
+
+--- /dev/null
++++ b/web/test/routes.test.mjs
+@@ -0,0 +1,109 @@
++import { test, after } from 'node:test';
++import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++import crypto from 'node:crypto';
++import { spawn } from 'node:child_process';
++import { pathToFileURL, fileURLToPath } from 'node:url';
++const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
++const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'vest-test-'));
++process.chdir(temp);
++process.env.APP_PASSWORD = 'test-password'; process.env.DEVICE_KEY = 'test-device-key'; process.env.SESSION_SECRET = 'test-session-secret';
++const storeFile = path.join(temp, 'store.mjs');
++fs.copyFileSync(path.join(root, 'lib/store.js'), storeFile);
++const storeURL = pathToFileURL(storeFile).href;
++const store = await import(storeURL);
++const routes = {};
++for (const name of ['login', 'config', 'hours', 'status', 'recalibrate', 'export', 'device/sync', 'data']) {
++ const file = path.join(root, 'app/api', name, 'route.js');
++ if (fs.existsSync(file)) { const target = path.join(temp, name.replaceAll('/', '-') + '.mjs'); fs.writeFileSync(target, fs.readFileSync(file, 'utf8').replaceAll("'@/lib/store'", JSON.stringify(storeURL))); routes[name] = await import(pathToFileURL(target).href); }
++}
++const token = store.makeToken();
++const signed = exp => exp + '.' + crypto.createHmac('sha256', process.env.SESSION_SECRET).update(String(exp)).digest('hex');
++const call = async (name, method, body, auth = token, extra = {}) => {
++ const headers = { 'content-type': 'application/json', ...extra };
++ if (auth !== null) headers.authorization = 'Bearer ' + auth;
++ const req = new Request('http://localhost/api/' + name, { method, headers, ...(body === undefined ? {} : {body: JSON.stringify(body)}) });
++ if (!routes[name]?.[method]) return new Response(null, { status: 404 });
++ return routes[name][method](req);
++};
++const device = b => call('device/sync', 'POST', b, null, {'x-device-key': process.env.DEVICE_KEY});
++const protectedRoutes = [['config','PUT'],['hours','GET'],['status','GET'],['recalibrate','POST'],['export','GET'],['data','DELETE']];
++function reset() { store.save({ hours: {}, config: {tol:12,delay:4,int:150,en:1},recal:0,lastSeen:0,calibrated:0 }); }
++after(() => { process.chdir(root); fs.rmSync(temp, {recursive:true,force:true}); });
++test('login: correct, wrong, malformed JSON, missing configuration', async () => {
++ assert.equal((await call('login','POST',{password:'wrong'},null)).status,401);
++ const r = await call('login','POST',{password:process.env.APP_PASSWORD},null); assert.equal(r.status,200); assert.ok((await r.json()).token);
++ assert.equal((await routes.login.POST(new Request('http://localhost', {method:'POST',body:'{'}))).status,401);
++ const key = process.env.DEVICE_KEY; delete process.env.DEVICE_KEY;
++ try { assert.equal((await call('login','POST',{},null)).status,500); } finally {process.env.DEVICE_KEY=key;}
++});
++for (const [name,method] of protectedRoutes) test(`${name}: rejects absent, forged, expired and extended tokens`, async () => {
++ for (const auth of [null, '123.fake', signed(Date.now()-1000), token+'.extra']) assert.equal((await call(name,method,undefined,auth)).status,401);
++});
++test('device key check', async () => {
++ for (const key of ['', 'wrong']) assert.equal((await call('device/sync','POST',{},null,{'x-device-key':key})).status,401);
++ assert.equal((await device({})).status,200);
++});
++test('config clamps values and status reflects saved settings',async()=>{
++ reset(); const r=await call('config','PUT',{tol:-100,delay:900,int:255,en:false}); assert.deepEqual(await r.json(),{tol:5,delay:30,int:200,en:0});
++ assert.deepEqual((await (await call('status','GET')).json()).config,{tol:5,delay:30,int:200,en:0});
++ assert.deepEqual(await (await call('config','PUT',{tol:900,delay:-10,int:-1,en:true})).json(),{tol:45,delay:1,int:50,en:1});
++});
++test('ago bucketing, summary clamps, retention and dynamic GETs',async()=>{
++ reset(); const real=Date.now, now=Date.UTC(2026,10,4,12,0,30); Date.now=()=>now;
++ try {
++  await device({cal:1,rows:[{ago:0,g:80,b:-1,c:90},{ago:60,g:20,b:40,c:1}]});
++  const h=store.load().hours; assert.deepEqual(h[now/1000-30],{g:60,b:0,c:50}); assert.deepEqual(h[now/1000-3630],{g:20,b:40,c:1});
++  assert.equal((await (await call('hours','GET')).json()).length,2);
++  for(const name of ['hours','status','export']) assert.equal(routes[name].dynamic,'force-dynamic');
++ } finally {Date.now=real;}
++});
++test('recalibration remains pending until device acknowledges',async()=>{
++ reset(); assert.equal((await call('recalibrate','POST')).status,200);
++ assert.match(await (await device({cal:0})).text(),/recal=1/);
++ assert.match(await (await device({cal:1,recalDone:1})).text(),/recal=0/);
++ assert.equal(store.load().calibrated,1);
++});
++test('export and deletion remove history and backups but preserve settings',async()=>{
++ reset(); await device({rows:[{g:30,b:20,c:1}]});
++ const e=await call('export','GET'); assert.match(e.headers.get('content-disposition'),/attachment/); assert.equal(Object.keys((await e.json()).hours).length,1);
++ assert.equal((await call('data','DELETE')).status,200); assert.deepEqual(store.load().hours,{}); assert.equal(store.load().config.int,150);
++ for(const f of fs.readdirSync(path.join(temp,'data/backups'))) assert.deepEqual(JSON.parse(fs.readFileSync(path.join(temp,'data/backups',f))).hours,{});
++});
++test('concurrent config parse and upload preserve both writes',async()=>{
++ reset(); let release; const gate=new Promise(r=>release=r);
++ const req={headers:new Headers({authorization:'Bearer '+token}),json:async()=>{await gate;return {tol:20,delay:4,int:150,en:true};}};
++ const pending=routes.config.PUT(req); await device({rows:[{g:40,b:20,c:1}]}); release(); await pending;
++ assert.equal(Object.keys(store.load().hours).length,1); assert.equal(store.load().config.tol,20);
++});
++test('null JSON and null rows do not crash handlers',async()=>{
++ assert.ok((await call('login','POST',null,null)).status<500);
++ assert.ok((await call('config','PUT',null)).status<500);
++ assert.ok((await device({rows:[null]})).status<500);
++});
++
++test('default days, numeric fallbacks, and expired history retention', async () => {
++ reset(); const db=store.load(), now=Date.now();
++ db.hours[Math.floor((now-2*864e5)/36e5)*3600]={g:10,b:0,c:0};
++ db.hours[Math.floor((now-401*864e5)/36e5)*3600]={g:10,b:0,c:0}; store.save(db);
++ assert.equal((await (await call('hours','GET')).json()).length,1);
++ await device({}); assert.equal(Object.keys(store.load().hours).length,1);
++ assert.deepEqual(await (await call('config','PUT',{tol:'bad',delay:'bad',int:'bad',en:true})).json(),{tol:12,delay:4,int:150,en:1});
++});
++test('concurrent uploads are all preserved', async () => {
++ reset(); await Promise.all(Array.from({length:20},()=>device({rows:[{g:1,b:1,c:1}]})));
++ assert.equal(Object.values(store.load().hours).reduce((n,h)=>n+h.g,0),20);
++});
++
++test('four processes share the disk transaction lock without losing writes', async () => {
++ reset();
++ const worker=path.join(temp,'worker.mjs');
++ fs.writeFileSync(worker,`import {update} from ${JSON.stringify(storeURL)}; for(let i=0;i<10;i++) await update(db=>{const h=db.hours['1'] ||= {g:0,b:0,c:0};h.g++;});`);
++ await Promise.all(Array.from({length:4},()=>new Promise((resolve,reject)=>{
++  const child=spawn(process.execPath,[worker],{cwd:temp,stdio:['ignore','ignore','pipe']}); let errors=''; child.stderr.on('data',x=>errors+=x);
++  child.on('error',reject);child.on('exit',code=>code===0?resolve():reject(new Error(errors)));
++ })));
++ assert.equal(store.load().hours['1'].g,40);
++});

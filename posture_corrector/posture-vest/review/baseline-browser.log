@@ -1,0 +1,15 @@
+login layout {'passwordLabel': 'Password', 'viewport': 375, 'width': 375}
+keyboard login Today
+dashboard layout {'controls': [{'id': 'tol', 'labels': ['Allowed movement 12 degrees'], 'type': 'range'}, {'id': 'delay', 'labels': ['Wait before buzzing 4 seconds'], 'type': 'range'}, {'id': 'int', 'labels': ['Buzz strength 59%'], 'type': 'range'}, {'id': '', 'labels': ['Buzzing on'], 'type': 'checkbox'}], 'viewport': 375, 'width': 375}
+AX controls [('image', 'Posture by hour today'), ('image', 'Daily posture: 22: 0%, 23: 0%, 24: 0%, 25: 0%, 26: 0%, 27: 0%, 28: 0%, 29: 0%, 30: 0%, 31: 0%, 1: 0%, 2: 0%, 3: 0%, 4: 0%'), ('button', 'Recalibrate vest'), ('slider', 'Allowed movement'), ('slider', 'Wait before buzzing'), ('slider', 'Buzz strength'), ('button', 'Save settings'), ('button', 'Download my data'), ('button', 'Delete all data'), ('button', 'Sign out'), ('checkbox', 'Buzzing on')]
+tab focus Recalibrate vest
+tab focus tol
+tab focus delay
+tab focus int
+tab focus 
+tab focus Save settings
+tab focus Download my data
+tab focus Delete all data
+console [{'level': 'SEVERE', 'message': 'http://127.0.0.1:3000/favicon.ico - Failed to load resource: the server responded with a status of 404 (Not Found)', 'source': 'network', 'timestamp': 1793839131729}, {'level': 'DEBUG', 'message': 'http://127.0.0.1:3000/ - [DOM] Password field is not contained in a form: (More info: https://goo.gl/9p2vKq) %o', 'source': 'recommendation', 'timestamp': 1793839131729}]
+denied localStorage {'text': 'Application error: a client-side exception has occurred (see the browser console for more information).', 'width': 375}
+denied console [{'level': 'SEVERE', 'message': 'http://127.0.0.1:3000/_next/static/chunks/117-3872fdc85f836239.js 0:4043 SecurityError: denied', 'source': 'console-api', 'timestamp': 1793839133147}]

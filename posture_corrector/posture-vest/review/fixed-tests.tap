@@ -1,0 +1,27 @@
+npm notice run posture-vest-web@1.0.0 test
+npm notice run node test/routes.test.mjs
+✔ login: correct, wrong, malformed JSON, missing configuration (32.91889ms)
+✔ config: rejects absent, forged, expired and extended tokens (1.471702ms)
+✔ hours: rejects absent, forged, expired and extended tokens (0.886176ms)
+✔ status: rejects absent, forged, expired and extended tokens (0.538786ms)
+✔ recalibrate: rejects absent, forged, expired and extended tokens (0.514679ms)
+✔ export: rejects absent, forged, expired and extended tokens (0.497564ms)
+✔ data: rejects absent, forged, expired and extended tokens (0.508472ms)
+✔ device key check (3.185894ms)
+✔ config clamps values and status reflects saved settings (3.383037ms)
+✔ ago bucketing, summary clamps, retention and dynamic GETs (1.915678ms)
+✔ recalibration remains pending until device acknowledges (2.015029ms)
+✔ export and deletion remove history and backups but preserve settings (1.662211ms)
+✔ concurrent config parse and upload preserve both writes (1.14616ms)
+✔ null JSON and null rows do not crash handlers (2.273846ms)
+✔ default days, numeric fallbacks, and expired history retention (1.564922ms)
+✔ concurrent uploads are all preserved (3.319876ms)
+✔ four processes share the disk transaction lock without losing writes (89.00873ms)
+ℹ tests 17
+ℹ suites 0
+ℹ pass 17
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 155.181828

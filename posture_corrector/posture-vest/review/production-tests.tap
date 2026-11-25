@@ -1,0 +1,12 @@
+✔ production login, wrong password, forged and expired auth on every protected route (249.659331ms)
+sync Transfer-Encoding: chunked Content-Length: null
+✔ production device key, clamp, live uncached status, hourly upload and calibration (35.299593ms)
+✔ production concurrent uploads, export and delete (96.828714ms)
+ℹ tests 3
+ℹ suites 0
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 392.496781

@@ -1,0 +1,35 @@
+npm notice run posture-vest-web@1.0.0 build
+npm notice run next build
+  ▲ Next.js 14.2.35
+
+   Creating an optimized production build ...
+ ✓ Compiled successfully
+   Linting and checking validity of types ...
+   Collecting page data ...
+   Generating static pages (0/8) ...
+   Generating static pages (2/8) 
+   Generating static pages (4/8) 
+   Generating static pages (6/8) 
+ ✓ Generating static pages (8/8)
+   Finalizing page optimization ...
+   Collecting build traces ...
+
+Route (app)                              Size     First Load JS
+┌ ○ /                                    2.98 kB        90.2 kB
+├ ○ /_not-found                          875 B          88.1 kB
+├ ƒ /api/config                          0 B                0 B
+├ ƒ /api/device/sync                     0 B                0 B
+├ ƒ /api/export                          0 B                0 B
+├ ƒ /api/hours                           0 B                0 B
+├ ƒ /api/login                           0 B                0 B
+├ ƒ /api/recalibrate                     0 B                0 B
+└ ƒ /api/status                          0 B                0 B
++ First Load JS shared by all            87.2 kB
+  ├ chunks/117-3872fdc85f836239.js       31.7 kB
+  ├ chunks/fd9d1056-88c8a1669018f964.js  53.7 kB
+  └ other shared chunks (total)          1.85 kB
+
+
+○  (Static)   prerendered as static content
+ƒ  (Dynamic)  server-rendered on demand
+

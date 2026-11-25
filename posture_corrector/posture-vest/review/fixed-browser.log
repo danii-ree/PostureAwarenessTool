@@ -1,0 +1,15 @@
+login layout {'passwordLabel': 'Password', 'viewport': 375, 'width': 375}
+keyboard login Today
+dashboard layout {'controls': [{'id': 'tol', 'labels': ['Allowed movement 12 degrees'], 'type': 'range'}, {'id': 'delay', 'labels': ['Wait before buzzing 4 seconds'], 'type': 'range'}, {'id': 'int', 'labels': ['Buzz strength 59%'], 'type': 'range'}, {'id': '', 'labels': ['Buzzing on'], 'type': 'checkbox'}], 'viewport': 375, 'width': 375}
+AX controls [('image', 'Posture by hour today: 0:00, target 0 seconds, outside 0 seconds; 1:00, target 0 seconds, outside 0 seconds; 2:00, target 0 seconds, outside 0 seconds; 3:00, target 0 seconds, outside 0 seconds; 4:00, target 0 seconds, outside 0 seconds; 5:00, target 0 seconds, outside 0 seconds; 6:00, target 0 seconds, outside 0 seconds; 7:00, target 0 seconds, outside 0 seconds; 8:00, target 0 seconds, outside 0 seconds; 9:00, target 0 seconds, outside 0 seconds; 10:00, target 0 seconds, outside 0 seconds; 11:00, target 0 seconds, outside 0 seconds; 12:00, target 0 seconds, outside 0 seconds; 13:00, target 0 seconds, outside 0 seconds; 14:00, target 0 seconds, outside 0 seconds; 15:00, target 0 seconds, outside 0 seconds; 16:00, target 0 seconds, outside 0 seconds; 17:00, target 0 seconds, outside 0 seconds; 18:00, target 0 seconds, outside 0 seconds; 19:00, target 0 seconds, outside 0 seconds; 20:00, target 0 seconds, outside 0 seconds; 21:00, target 0 seconds, outside 0 seconds; 22:00, target 0 seconds, outside 0 seconds; 23:00, target 0 seconds, outside 0 seconds'), ('image', 'Daily posture: 22: 0%, 23: 0%, 24: 0%, 25: 0%, 26: 0%, 27: 0%, 28: 0%, 29: 0%, 30: 0%, 31: 0%, 1: 0%, 2: 0%, 3: 0%, 4: 0%'), ('button', 'Recalibrate vest'), ('slider', 'Allowed movement'), ('slider', 'Wait before buzzing'), ('slider', 'Buzz strength'), ('button', 'Save settings'), ('button', 'Download my data'), ('button', 'Delete all data'), ('button', 'Sign out'), ('checkbox', 'Buzzing on')]
+tab focus Recalibrate vest
+tab focus tol
+tab focus delay
+tab focus int
+tab focus 
+tab focus Save settings
+tab focus Download my data
+tab focus Delete all data
+console [{'level': 'SEVERE', 'message': 'http://127.0.0.1:3000/favicon.ico - Failed to load resource: the server responded with a status of 404 (Not Found)', 'source': 'network', 'timestamp': 1793839364326}, {'level': 'DEBUG', 'message': 'http://127.0.0.1:3000/ - [DOM] Password forms should have (optionally hidden) username fields for accessibility: (More info: https://goo.gl/9p2vKq) %o', 'source': 'recommendation', 'timestamp': 1793839364326}]
+denied localStorage {'text': 'Posture progress\n\nEnter the password for this vest.\n\nPasswordSign in', 'width': 375}
+denied console [{'level': 'DEBUG', 'message': 'http://127.0.0.1:3000/ - [DOM] Password forms should have (optionally hidden) username fields for accessibility: (More info: https://goo.gl/9p2vKq) %o', 'source': 'recommendation', 'timestamp': 1793839366865}]

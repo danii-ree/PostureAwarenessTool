@@ -1,0 +1,17 @@
+:root{--bg:#eef2f0;--ink:#16262b;--muted:#5a6d72;--good:#2e7d6b;--bad:#c9822b;--line:#cdd8d4;--panel:#fff}
+@media (prefers-color-scheme:dark){:root{--bg:#10191c;--ink:#e6efed;--muted:#97aaae;--good:#52b59f;--bad:#e0a04f;--line:#2b3a3e;--panel:#18262a}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:17px/1.5 "Atkinson Hyperlegible",system-ui,sans-serif}
+main{max-width:640px;margin:0 auto;padding:24px 18px 64px}
+h1{font-size:1.6rem;margin:0 0 4px}h2{font-size:1.15rem;margin:36px 0 8px}
+p{margin:0 0 12px}.muted{color:var(--muted)}
+button{font:inherit;font-weight:700;padding:12px 18px;border-radius:8px;border:2px solid var(--ink);background:var(--ink);color:var(--bg);cursor:pointer;min-height:44px}
+button.alt{background:none;color:var(--ink)}button.danger{border-color:#b3261e;color:#b3261e;background:none}
+button:focus-visible,input:focus-visible{outline:3px solid var(--good);outline-offset:2px}
+input[type=password]{font:inherit;padding:11px;border:2px solid var(--line);border-radius:8px;background:var(--panel);color:var(--ink);width:100%;margin-bottom:12px}
+svg{width:100%;height:auto;display:block}svg text{fill:var(--muted);font-size:10px;font-family:inherit}
+.swatch{display:inline-block;width:12px;height:12px;border-radius:2px;margin-right:6px;vertical-align:-1px}
+.row{margin:18px 0}.row label{display:flex;justify-content:space-between;font-weight:700}
+input[type=range]{width:100%;accent-color:var(--good);height:36px}
+.btns{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}
+.msg{min-height:1.5em;color:var(--good);font-weight:700}.err{color:#b3261e}
